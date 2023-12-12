@@ -16,6 +16,10 @@ require_relative "goo/sparql/sparql"
 require_relative "goo/search/search"
 require_relative "goo/base/base"
 require_relative "goo/validators/enforce"
+require_relative "goo/validators/validator"
+project_root = File.dirname(File.absolute_path(__FILE__))
+Dir.glob("#{project_root}/goo/validators/implementations/*", &method(:require))
+
 require_relative "goo/utils/utils"
 require_relative "goo/mixins/sparql_client"
 
@@ -28,6 +32,7 @@ module Goo
   # Define the languages from which the properties values will be taken
   # It choose the first language that match otherwise return all the values
   @@main_languages = %w[en]
+  @@requested_language = nil
 
   @@configure_flag = false
   @@sparql_backends = {}
@@ -52,6 +57,14 @@ module Goo
   end
   def self.main_languages=(lang)
     @@main_languages = lang
+  end
+
+  def self.requested_language
+    @@requested_language
+  end
+
+  def self.requested_language=(lang)
+    @@requested_language = lang
   end
 
   def self.language_includes(lang)

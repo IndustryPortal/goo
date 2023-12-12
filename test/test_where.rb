@@ -262,6 +262,19 @@ class TestWhere < MiniTest::Unit::TestCase
     end
   end
 
+  def test_paging_with_filter_order
+
+    f = Goo::Filter.new(:birth_date) > DateTime.parse('1978-01-03')
+    total_count = Student.where.filter(f).count
+    page_1 = Student.where.include(:name, :birth_date).page(1, total_count - 1).filter(f).order_by(name: :asc).to_a
+    refute_empty page_1
+    assert page_1.next?
+    page_2 = Student.where.include(:name, :birth_date).page(page_1.next_page, total_count - 1).filter(f).order_by(name: :asc).to_a
+
+
+    refute_empty page_2
+    assert_equal total_count, page_1.size + page_2.size
+  end
 
   def test_unique_object_references
 
@@ -598,6 +611,17 @@ class TestWhere < MiniTest::Unit::TestCase
         assert_instance_of Category, c
       end
     end
+  end
+
+  def test_complex_order_by
+    u = University.where.include(address: [:country]).order_by(address: {country: :asc}).all
+    countries = u.map {|x| x.address.map{|a| a.country}}.flatten
+    assert_equal countries.sort, countries
+
+
+    u = University.where.include(address: [:country]).order_by(address: {country: :desc}).all
+    countries = u.map {|x| x.address.map{|a| a.country}}.flatten
+    assert_equal countries.sort{|a,b| b<=>a }, countries
   end
 
 end

@@ -15,7 +15,7 @@ module Goo
       attr_reader :modified_attributes
       attr_reader :errors
       attr_reader :aggregates
-      attr_reader :unmapped
+      attr_writer :unmapped
 
       attr_reader :id
 
@@ -74,23 +74,10 @@ module Goo
       end
 
       def id
-        if @id.nil?
-          raise IDGenerationError, ":id must be set if configured in name_with" if self.class.name_with == :id
-          custom_name = self.class.name_with
-          if custom_name.instance_of?(Symbol)
-            @id = id_from_attribute()
-          elsif custom_name
-            begin
-              @id = custom_name.call(self)
-            rescue => e
-              raise IDGenerationError, "Problem with custom id generation: #{e.message}"
-            end
-          else
-            raise IDGenerationError, "custom_name is nil. settings for this model are incorrect."
+        @id = generate_id if @id.nil?
+
+        @id
           end
-        end
-        return @id
-      end
 
       def persistent?
         return @persistent
@@ -104,22 +91,20 @@ module Goo
         return modified_attributes.length > 0
       end
 
-      def exist?(from_valid=false)
-        #generate id with proc
-        begin
-          id() unless self.class.name_with.kind_of?(Symbol)
-        rescue IDGenerationError
-        end
+      def exist?(from_valid = false)
+          begin
+          id unless self.class.name_with.kind_of?(Symbol)
+          rescue IDGenerationError
+          # Ignored
+          end
 
         _id = @id
-        if _id.nil? && !from_valid && self.class.name_with.is_a?(Symbol)
-          begin
-            _id = id_from_attribute()
-          rescue IDGenerationError
-          end
+        if from_valid || _id.nil?
+          _id = generate_id rescue _id = nil
         end
+
         return false unless _id
-        return Goo::SPARQL::Queries.model_exist(self,id=_id)
+        Goo::SPARQL::Queries.model_exist(self, id = _id)
       end
 
       def fully_loaded?
@@ -134,15 +119,27 @@ module Goo
 
       def unmapped_set(attribute,value)
         @unmapped ||= {}
-        (@unmapped[attribute] ||= Set.new) << value
+        @unmapped[attribute] ||= Set.new
+        @unmapped[attribute].merge(Array(value)) unless value.nil?
+      end
+ 
+      def unmapped_get(attribute)
+        @unmapped[attribute]
       end
 
       def unmmaped_to_array
         cpy = {}
+        
         @unmapped.each do |attr,v|
           cpy[attr] = v.to_a
         end
         @unmapped = cpy
+      end
+
+      def unmapped(*args)
+        @unmapped&.transform_values do  |language_values|
+          self.class.not_show_all_languages?(language_values, args) ?  language_values.values.flatten: language_values
+        end
       end
 
       def delete(*args)
@@ -235,10 +232,13 @@ module Goo
           raise ArgumentError, "Enums can only be created on initialization" unless opts[0] && opts[0][:init_enum]
         end
         batch_file = nil
-        if opts && opts.length > 0
-          if opts.first.is_a?(Hash) && opts.first[:batch] && opts.first[:batch].is_a?(File)
+        callbacks = true
+        if opts && opts.length > 0 && opts.first.is_a?(Hash)
+          if opts.first[:batch] && opts.first[:batch].is_a?(File)
             batch_file = opts.first[:batch]
           end
+
+          callbacks = opts.first[:callbacks]
         end
 
         if !batch_file
@@ -246,8 +246,28 @@ module Goo
           raise Goo::Base::NotValidException, "Object is not valid. Check errors." unless valid?
         end
 
+        #set default values before saving
+        unless self.persistent?
+          self.class.attributes_with_defaults.each do |attr|
+            value = self.send("#{attr}")
+            if value.nil?
+              value = self.class.default(attr).call(self)
+              self.send("#{attr}=", value)
+            end
+          end
+        end
+
+        #call update callback before saving
+        if callbacks
+          self.class.attributes_with_update_callbacks.each do |attr|
+            Goo::Validators::Enforce.enforce_callbacks(self, attr)
+          end
+        end
+
         graph_insert, graph_delete = Goo::SPARQL::Triples.model_update_triples(self)
-        graph = self.graph()
+        graph = self.graph
+
+
         if graph_delete and graph_delete.size > 0
           begin
             Goo.sparql_update_client.delete_data(graph_delete, graph: graph)
@@ -341,13 +361,13 @@ module Goo
 
 
 
-      def self.map_attributes(inst,equivalent_predicates=nil)
+      def self.map_attributes(inst,equivalent_predicates=nil, include_languages: false)
         if (inst.kind_of?(Goo::Base::Resource) && inst.unmapped.nil?) ||
           (!inst.respond_to?(:unmapped) && inst[:unmapped].nil?)
           raise ArgumentError, "Resource.map_attributes only works for :unmapped instances"
         end
         klass = inst.respond_to?(:klass) ? inst[:klass] : inst.class
-        unmapped = inst.respond_to?(:klass) ? inst[:unmapped] : inst.unmapped
+        unmapped = inst.respond_to?(:klass) ? inst[:unmapped] : inst.unmapped(include_languages: include_languages)
         list_attrs = klass.attributes(:list)
         unmapped_string_keys = Hash.new
         unmapped.each do |k,v|
@@ -378,31 +398,18 @@ module Goo
               object = unmapped_string_keys[attr_uri]
             end
 
-            lang_filter = Goo::SPARQL::Solution::LanguageFilter.new
-
-            object = object.map do |o|
-              if o.is_a?(RDF::URI)
-                o
-              else
-                literal = o
-                index, lang_val  = lang_filter.main_lang_filter inst.id.to_s, attr, literal
-                lang_val.to_s if index.eql? :no_lang
-              end
-            end
-
-            object = object.compact
-
-            other_languages_values = lang_filter.other_languages_values
-            other_languages_values = other_languages_values[inst.id.to_s][attr] unless other_languages_values.empty?
-            unless other_languages_values.nil?
-              object = lang_filter.languages_values_to_set(other_languages_values, object)
+            if object.is_a?(Hash)
+              object = object.transform_values{|values| Array(values).map{|o|o.is_a?(RDF::URI) ? o : o.object}}
+            else
+              object = object.map {|o| o.is_a?(RDF::URI) ? o : o.object}
             end
 
             if klass.range(attr)
               object = object.map { |o|
                 o.is_a?(RDF::URI) ? klass.range_object(attr,o) : o }
             end
-            object = object.first unless list_attrs.include?(attr)
+
+            object = object.first unless list_attrs.include?(attr) || include_languages
             if inst.respond_to?(:klass)
               inst[attr] = object
             else
@@ -411,11 +418,6 @@ module Goo
           else
             inst.send("#{attr}=",
                       list_attrs.include?(attr) ? [] : nil, on_load: true)
-            if inst.id.to_s == "http://purl.obolibrary.org/obo/IAO_0000415"
-              if attr == :definition
-                # binding.pry
-              end
-            end
           end
 
         end
@@ -448,10 +450,30 @@ module Goo
       end
 
       protected
+
       def id_from_attribute()
         uattr = self.class.name_with
         uvalue = self.send("#{uattr}")
-        return self.class.id_from_unique_attribute(uattr,uvalue)
+        return self.class.id_from_unique_attribute(uattr, uvalue)
+      end
+
+      def generate_id
+        return nil unless self.class.name_with
+
+        raise IDGenerationError, ":id must be set if configured in name_with" if self.class.name_with == :id
+        custom_name = self.class.name_with
+        if custom_name.instance_of?(Symbol)
+          id = id_from_attribute
+        elsif custom_name
+          begin
+            id = custom_name.call(self)
+          rescue => e
+            raise IDGenerationError, "Problem with custom id generation: #{e.message}"
+          end
+        else
+          raise IDGenerationError, "custom_name is nil. settings for this model are incorrect."
+        end
+        id
       end
 
     end
